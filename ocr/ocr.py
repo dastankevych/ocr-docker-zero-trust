@@ -8,6 +8,7 @@ import pytesseract
 import subprocess
 from subprocess import Popen
 import time
+from zt_integration import get_manifest, decrypt_payload
 
 try:
     from PIL import Image
@@ -42,6 +43,48 @@ app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = "/opt/ocr/tmp"
 api = Api(app)
 
+
+@app.route('/zt-manifest', methods=['GET'])
+def zt_manifest():
+    origin = request.headers.get('Host', '')
+    if origin:
+        origin = f"https://{origin}"
+    return jsonify(get_manifest(origin))
+
+@app.route('/v1/submit', methods=['POST'])
+def zt_submit():
+    try:
+        fields = decrypt_payload(request.get_json())
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 400
+
+    doc = fields.get('document') or {}
+    language = fields.get('language') or 'eng'
+    file_b64 = doc.get('file_data_b64') if isinstance(doc, dict) else None
+
+    if not file_b64:
+        return jsonify({'ok': False, 'error': 'no document'}), 400
+
+    try:
+        file_bytes = base64.b64decode(file_b64)
+        file_name  = doc.get('file_name', 'upload.png').lower()
+        tmp_path   = os.path.join(app.config['UPLOAD_FOLDER'], f'zt_{uuid.uuid4().hex}_{file_name}')
+        with open(tmp_path, 'wb') as f:
+            f.write(file_bytes)
+        if tmp_path.endswith('.pdf'):
+            tmp_path = convert_to_tiff(tmp_path)
+        if tmp_path.endswith('.tiff'):
+            img = Image.open(tmp_path)
+            txt = ''
+            for frame in range(img.n_frames):
+                img.seek(frame)
+                txt += pytesseract.image_to_string(img, config='--psm 6', lang=language) + '\n'
+        else:
+            txt = pytesseract.image_to_string(Image.open(tmp_path), lang=language)
+        os.remove(tmp_path)
+        return jsonify({'ok': True, 'text': txt})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 
 @app.route('/ocr', methods=['POST'])
