@@ -1,7 +1,7 @@
 #!/bin/bash
 set -em
 
-/usr/bin/python3 /opt/ocr/ocr.py &
+python /opt/ocr/ocr.py &
 PYTHON_PID=$!
 
 sleep 2
