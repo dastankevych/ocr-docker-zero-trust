@@ -25,8 +25,6 @@ const DEFAULT_VSOCK_PORT: u32 = 5005;
 const DEFAULT_HTTP_PORT: u16 = 9999;
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0";
 const DEFAULT_COCO_CONFIG_PATH: &str = "/app/coco-runtime-config.json";
-const DEFAULT_REPO_URL: &str = "https://github.com/rusyaew/ztinfra-enclaveproducedhtml";
-const DEFAULT_PROJECT_REPO_URL: &str = "https://github.com/rusyaew/ztbrowser";
 const DEFAULT_WORKLOAD_ID: &str = "ztbrowser-aws-nitro";
 const ATTESTED_RESPONSE_VERSION: &str = "zt-attested-response/v1";
 const NITRO_PLATFORM: &str = "aws_nitro_eif";
@@ -57,6 +55,8 @@ struct EnclaveRequest {
     content_type: Option<String>,
     #[serde(default)]
     body_b64: Option<String>,
+    #[serde(default)]
+    host_origin: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -152,8 +152,18 @@ async fn handle_connection(stream: tokio_vsock::VsockStream) -> Result<()> {
         serde_json::from_str(request_line.trim()).context("Request is not valid JSON")?;
     let response = match request.action.as_str() {
         "index" => {
-            let content_type = "text/html; charset=utf-8";
-            let html = render_index_html();
+            let (status, content_type, body_bytes) = proxy_local_app(
+                "GET",
+                request.path.as_deref().unwrap_or("/"),
+                request.host_origin.as_deref(),
+                None,
+                &[],
+            )
+            .await?;
+            if status != 200 {
+                bail!("Landing page returned unexpected status: {status}");
+            }
+            let html = String::from_utf8(body_bytes).context("Landing page HTML was not UTF-8")?;
             let service = request.service.as_deref().unwrap_or(DEFAULT_WORKLOAD_ID);
             let release_id = request.release_id.as_deref().unwrap_or(DEFAULT_WORKLOAD_ID);
             let platform = request.platform.as_deref().unwrap_or(NITRO_PLATFORM);
@@ -167,7 +177,7 @@ async fn handle_connection(stream: tokio_vsock::VsockStream) -> Result<()> {
                             method: request.method.as_deref().unwrap_or("GET"),
                             path: request.path.as_deref().unwrap_or("/"),
                             status: 200,
-                            content_type,
+                            content_type: &content_type,
                             challenge,
                             service,
                             release_id,
@@ -185,6 +195,8 @@ async fn handle_connection(stream: tokio_vsock::VsockStream) -> Result<()> {
                 response_signing_key_id: None,
                 response_signing_key_binding: None,
                 signed_response,
+                status: None,
+                body_b64: None,
             }
         }
         "attestation" => {
@@ -215,7 +227,9 @@ async fn handle_connection(stream: tokio_vsock::VsockStream) -> Result<()> {
                 Some(binding_bytes),
             )?;
             
-            let (workload_pubkey, trusted_input_service) = fetch_local_manifest().await.unwrap_or((Value::Null, Value::Null));
+            let (workload_pubkey, trusted_input_service) = fetch_local_manifest(request.host_origin.as_deref())
+                .await
+                .unwrap_or((Value::Null, Value::Null));
             let mut claims_obj = serde_json::Map::new();
             claims_obj.insert("workload_pubkey".to_string(), workload_pubkey);
             claims_obj.insert("identity_hint".to_string(), Value::Null);
@@ -283,43 +297,25 @@ async fn handle_connection(stream: tokio_vsock::VsockStream) -> Result<()> {
         "http" => {
             let method = request.method.as_deref().unwrap_or("GET");
             let path = request.path.as_deref().unwrap_or("/");
-            let mut stream = tokio::net::TcpStream::connect("127.0.0.1:8080").await?;
-            let mut req = format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\n");
-            if let Some(content_type) = request.content_type.as_deref() {
-                req.push_str(&format!("Content-Type: {content_type}\r\n"));
-            }
             let body = if let Some(b64) = request.body_b64.as_deref() {
                 BASE64_STANDARD.decode(b64).unwrap_or_default()
             } else {
                 Vec::new()
             };
-            req.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
-            stream.write_all(req.as_bytes()).await?;
-            stream.write_all(&body).await?;
-            let mut response = Vec::new();
-            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response).await?;
-            let response_text = String::from_utf8_lossy(&response);
-            let (headers, _) = response_text.split_once("\r\n\r\n").unwrap_or(("", ""));
-            let mut status = 502;
-            let mut content_type = "application/octet-stream".to_string();
-            if let Some(line) = headers.lines().next() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 1 {
-                    status = parts[1].parse().unwrap_or(502);
-                }
-            }
-            for line in headers.lines() {
-                if line.to_lowercase().starts_with("content-type:") {
-                    content_type = line.split(':').nth(1).unwrap_or("").trim().to_string();
-                }
-            }
-            let body_bytes = if headers.len() + 4 <= response.len() { &response[headers.len() + 4..] } else { &[] };
+            let (status, content_type, body_bytes) = proxy_local_app(
+                method,
+                path,
+                request.host_origin.as_deref(),
+                request.content_type.as_deref(),
+                &body,
+            )
+            .await?;
             
             let service = request.service.as_deref().unwrap_or(DEFAULT_WORKLOAD_ID);
             let release_id = request.release_id.as_deref().unwrap_or(DEFAULT_WORKLOAD_ID);
             let platform = request.platform.as_deref().unwrap_or(NITRO_PLATFORM);
             let signed_response = request.response_challenge.as_deref().map(|challenge| {
-                sign_response_headers(body_bytes, ResponseSigningContext {
+                sign_response_headers(&body_bytes, ResponseSigningContext {
                     method, path, status, content_type: &content_type, challenge, service, release_id, platform
                 })
             }).transpose()?;
@@ -352,26 +348,73 @@ async fn handle_connection(stream: tokio_vsock::VsockStream) -> Result<()> {
     Ok(())
 }
 
-fn render_index_html() -> String {
-    let repo_url = env::var("REPO_URL").unwrap_or_else(|_| DEFAULT_REPO_URL.to_string());
-    let project_repo_url =
-        env::var("PROJECT_REPO_URL").unwrap_or_else(|_| DEFAULT_PROJECT_REPO_URL.to_string());
-    let workload_id = env::var("WORKLOAD_ID").unwrap_or_else(|_| DEFAULT_WORKLOAD_ID.to_string());
-
-    format!(
-        "<!DOCTYPE html><html><head><title>ZT infra enclave produced HTML</title></head><body><h1>Hello from Nitro enclave</h1><p>This HTML page was generated inside the enclave and returned to the parent over <code>vsock</code>.</p><ul><li>workload_id: <code>{}</code></li><li>repo_url: <code>{}</code></li><li>project_repo_url: <code>{}</code></li><li>origin: <code>aws nitro enclave</code></li></ul></body></html>",
-        workload_id, repo_url, project_repo_url
-    )
+fn origin_authority(origin: Option<&str>) -> &str {
+    origin
+        .and_then(|value| value.split("://").nth(1))
+        .unwrap_or("localhost")
 }
 
-async fn fetch_local_manifest() -> Result<(Value, Value)> {
+fn origin_scheme(origin: Option<&str>) -> &str {
+    origin
+        .and_then(|value| value.split("://").next())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http")
+}
+
+async fn proxy_local_app(
+    method: &str,
+    path: &str,
+    host_origin: Option<&str>,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<(u16, String, Vec<u8>)> {
     let mut stream = tokio::net::TcpStream::connect("127.0.0.1:8080").await?;
-    tokio::io::AsyncWriteExt::write_all(&mut stream, b"GET /zt-manifest HTTP/1.0\r\nHost: localhost\r\n\r\n").await?;
+    let mut request = format!(
+        "{method} {path} HTTP/1.0\r\nHost: {}\r\nX-Forwarded-Proto: {}\r\n",
+        origin_authority(host_origin),
+        origin_scheme(host_origin),
+    );
+    if let Some(content_type) = content_type {
+        request.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes()).await?;
+    tokio::io::AsyncWriteExt::write_all(&mut stream, body).await?;
     let mut response = Vec::new();
     tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response).await?;
-    let response_text = String::from_utf8(response)?;
-    let (_, body) = response_text.split_once("\r\n\r\n").ok_or_else(|| anyhow::anyhow!("Invalid HTTP"))?;
-    let manifest: Value = serde_json::from_str(body)?;
+    let response_text = String::from_utf8_lossy(&response);
+    let (headers, _) = response_text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("Invalid HTTP"))?;
+    let mut status = 502;
+    let mut response_content_type = "application/octet-stream".to_string();
+    if let Some(line) = headers.lines().next() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() > 1 {
+            status = parts[1].parse().unwrap_or(502);
+        }
+    }
+    for line in headers.lines() {
+        if line.to_ascii_lowercase().starts_with("content-type:") {
+            response_content_type = line.split(':').nth(1).unwrap_or("").trim().to_string();
+        }
+    }
+    let body_offset = headers.len() + 4;
+    let response_body = if body_offset <= response.len() {
+        response[body_offset..].to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok((status, response_content_type, response_body))
+}
+
+async fn fetch_local_manifest(host_origin: Option<&str>) -> Result<(Value, Value)> {
+    let (status, _content_type, body) =
+        proxy_local_app("GET", "/zt-manifest", host_origin, None, &[]).await?;
+    if status != 200 {
+        bail!("Manifest endpoint returned unexpected status: {status}");
+    }
+    let manifest: Value = serde_json::from_slice(&body)?;
     Ok((
         manifest.get("workload_pubkey").cloned().unwrap_or(Value::Null),
         manifest.get("trusted_input_service").cloned().unwrap_or(Value::Null),
@@ -422,6 +465,8 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
     let method = parts[0];
     let path = parts[1];
     let mut content_length = 0usize;
+    let mut content_type: Option<String> = None;
+    let mut host_origin: Option<String> = None;
     let mut response_challenge: Option<String> = None;
     loop {
         let mut line = String::new();
@@ -433,6 +478,10 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
         if let Some((name, value)) = trimmed.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
                 content_length = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("content-type") {
+                content_type = Some(value.trim().to_string());
+            } else if name.eq_ignore_ascii_case("host") {
+                host_origin = Some(format!("http://{}", value.trim()));
             } else if name.eq_ignore_ascii_case("x-zt-challenge") {
                 response_challenge = Some(value.trim().to_string());
             }
@@ -441,7 +490,11 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
 
     match (method, path) {
         ("GET", "/") => {
-            let html = render_coco_index_html();
+            let (status, page_content_type, html) = tokio::runtime::Handle::current()
+                .block_on(proxy_local_app("GET", "/", host_origin.as_deref(), None, &[]))?;
+            if status != 200 {
+                bail!("Landing page returned unexpected status: {status}");
+            }
             let signed = if let Some(challenge) = response_challenge.as_deref() {
                 let config = load_coco_config()?;
                 let service = config["service"]
@@ -453,12 +506,12 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
                     .and_then(Value::as_str)
                     .unwrap_or(COCO_PLATFORM);
                 Some(sign_response_headers(
-                    html.as_bytes(),
+                    &html,
                     ResponseSigningContext {
                         method,
                         path,
                         status: 200,
-                        content_type: "text/html; charset=utf-8",
+                        content_type: &page_content_type,
                         challenge,
                         service,
                         release_id,
@@ -471,8 +524,8 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
             write_http_response(
                 &mut stream,
                 200,
-                "text/html; charset=utf-8",
-                html.as_bytes(),
+                &page_content_type,
+                &html,
                 signed.as_ref(),
             )?;
         }
@@ -527,6 +580,9 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
                         config["initdata_hash"].as_str().unwrap_or_default()
                     )
                 });
+            let (workload_pubkey, trusted_input_service) = tokio::runtime::Handle::current()
+                .block_on(fetch_local_manifest(host_origin.as_deref()))
+                .unwrap_or((Value::Null, Value::Null));
             let envelope = json!({
                 "version": "ztinfra-attestation/v1",
                 "service": config["service"],
@@ -534,11 +590,12 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
                 "platform": platform,
                 "nonce": nonce,
                 "claims": {
-                    "workload_pubkey": config.get("workload_pubkey").cloned().unwrap_or(Value::Null),
+                    "workload_pubkey": workload_pubkey,
                     "identity_hint": identity_hint,
                     "response_signing_key": public_jwk,
                     "response_signing_key_id": key_id,
                     "response_signing_key_binding": binding,
+                    "trusted_input_service": trusted_input_service,
                 },
                 "evidence": {
                     "type": "coco_trustee_evidence",
@@ -570,22 +627,33 @@ fn handle_http_connection(mut stream: TcpStream) -> Result<()> {
             )?;
         }
         _ => {
-            let body = b"not_found";
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 {
+                reader.read_exact(&mut body)?;
+            }
+            let (status, response_content_type, response_body) = tokio::runtime::Handle::current()
+                .block_on(proxy_local_app(
+                    method,
+                    path,
+                    host_origin.as_deref(),
+                    content_type.as_deref(),
+                    &body,
+                ))?;
             let signed = sign_coco_response_if_challenged(
                 response_challenge.as_deref(),
-                body,
+                &response_body,
                 method,
                 path,
-                404,
-                "text/plain; charset=utf-8",
+                status,
+                &response_content_type,
             )?;
             write_http_response(
                 &mut stream,
-                404,
-                "text/plain; charset=utf-8",
-                body,
+                status,
+                &response_content_type,
+                &response_body,
                 signed.as_ref(),
-            )?
+            )?;
         }
     }
 
@@ -636,7 +704,20 @@ fn sign_coco_response_if_challenged(
     let Some(challenge) = challenge else {
         return Ok(None);
     };
-    let release_id = env::var("RELEASE_ID").unwrap_or_else(|_| "unknown-release".to_string());
+    let config = load_coco_config().unwrap_or(Value::Null);
+    let service = config
+        .get("service")
+        .and_then(Value::as_str)
+        .unwrap_or("ztinfra-enclaveproducedhtml");
+    let release_id = config
+        .get("release_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| env::var("RELEASE_ID").unwrap_or_else(|_| "unknown-release".to_string()));
+    let platform = config
+        .get("platform")
+        .and_then(Value::as_str)
+        .unwrap_or(COCO_PLATFORM);
     Ok(Some(sign_response_headers(
         body,
         ResponseSigningContext {
@@ -645,9 +726,9 @@ fn sign_coco_response_if_challenged(
             status,
             content_type,
             challenge,
-            service: "ztinfra-enclaveproducedhtml",
+            service,
             release_id: &release_id,
-            platform: COCO_PLATFORM,
+            platform,
         },
     )?))
 }
@@ -806,12 +887,6 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn hex_to_bytes(value: &str) -> Result<Vec<u8>> {
     parse_nonce_hex(value)
-}
-
-fn render_coco_index_html() -> String {
-    env::var("COCO_INDEX_HTML").unwrap_or_else(|_| {
-        "<!DOCTYPE html><html><head><title>ZT infra enclave produced HTML</title></head><body><h1>Hello from CoCo workload</h1><p>This HTML page was generated by the same canonical workload container lowered for AWS CoCo.</p></body></html>".to_string()
-    })
 }
 
 fn load_coco_config() -> Result<Value> {
