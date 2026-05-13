@@ -20,6 +20,7 @@ RUN apt update -yqq && apt -yqq install software-properties-common
 RUN add-apt-repository ppa:alex-p/tesseract-ocr-devel -y
 
 RUN apt -yqq install python3-pip \
+    python3-venv \
     libffi-dev \
     libssl-dev \
     tesseract-ocr \
@@ -27,16 +28,19 @@ RUN apt -yqq install python3-pip \
     imagemagick \
     curl \
     && rm -rf /var/lib/apt/lists/*
-    
-RUN pip3 install --upgrade pip --no-cache-dir && \
-    pip3 install --upgrade setuptools --no-cache-dir && \
-    pip3 install flask --no-cache-dir && \
-    pip3 install flask_restful --no-cache-dir && \
-    pip3 install loguru --no-cache-dir && \
-    pip3 install cryptography --no-cache-dir && \
-    pip3 install pytesseract --no-cache-dir && \
-    pip3 install Pillow --no-cache-dir && \
-    pip3 install pyyaml --no-cache-dir
+
+RUN python3 -m venv /opt/ocr-venv
+ENV PATH="/opt/ocr-venv/bin:${PATH}"
+
+RUN pip install --upgrade pip --no-cache-dir && \
+    pip install --upgrade setuptools wheel --no-cache-dir && \
+    pip install flask --no-cache-dir && \
+    pip install flask_restful --no-cache-dir && \
+    pip install loguru --no-cache-dir && \
+    pip install cryptography --no-cache-dir && \
+    pip install pytesseract --no-cache-dir && \
+    pip install Pillow --no-cache-dir && \
+    pip install pyyaml --no-cache-dir
      
 RUN mkdir -p /opt/ocr/tmp
 RUN sed -i_bak 's/rights="none" pattern="PDF"/rights="read | write" pattern="PDF"/' /etc/ImageMagick-6/policy.xml
