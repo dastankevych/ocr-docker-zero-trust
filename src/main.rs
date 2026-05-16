@@ -370,7 +370,7 @@ async fn proxy_local_app(
 ) -> Result<(u16, String, Vec<u8>)> {
     let mut stream = tokio::net::TcpStream::connect("127.0.0.1:8080").await?;
     let mut request = format!(
-        "{method} {path} HTTP/1.0\r\nHost: {}\r\nX-Forwarded-Proto: {}\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {}\r\nX-Forwarded-Proto: {}\r\nConnection: close\r\n",
         origin_authority(host_origin),
         origin_scheme(host_origin),
     );
