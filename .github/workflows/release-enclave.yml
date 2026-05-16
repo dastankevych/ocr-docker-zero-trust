@@ -1,0 +1,166 @@
+name: Release Enclave
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      WORKLOAD_ID: ocr-demo-aws-nitro
+      ENCLAVE_REPO_URL: https://github.com/dastankevych/ocr-docker-zero-trust
+      PROJECT_REPO_URL: https://github.com/rusyaew/ztbrowser
+      NITRO_CLI_SOURCE_REPO: https://github.com/aws/aws-nitro-enclaves-cli.git
+      NITRO_CLI_SOURCE_TAG: v1.4.4
+    steps:
+      - name: Check out enclave repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install builder dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang git libclang-dev libssl-dev make pkg-config python3 python3-pip
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+
+      - name: Install Nitro CLI from pinned source
+        run: |
+          INSTALL_ROOT="$GITHUB_WORKSPACE/.nitro-cli" \
+          NITRO_CLI_SOURCE_REPO="$NITRO_CLI_SOURCE_REPO" \
+          NITRO_CLI_SOURCE_TAG="$NITRO_CLI_SOURCE_TAG" \
+          tools/install-nitro-cli.sh
+          echo "$GITHUB_WORKSPACE/.nitro-cli/bin" >> "$GITHUB_PATH"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build enclave artifacts
+        env:
+          IMAGE_TAG: ghcr.io/${{ github.repository_owner }}/ocr-demo:${{ github.ref_name }}
+        run: |
+          scripts/build-enclave.sh build
+          docker tag "$IMAGE_TAG" "$IMAGE_TAG"
+          docker push "$IMAGE_TAG"
+          IMAGE_DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE_TAG" | cut -d'@' -f2)"
+          echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> "$GITHUB_ENV"
+          echo "DOCKER_VERSION=$(docker --version | sed 's/^Docker version //; s/,.*//')" >> "$GITHUB_ENV"
+          echo "RUST_VERSION=$(rustc --version | awk '{print $2}')" >> "$GITHUB_ENV"
+          echo "CARGO_VERSION=$(cargo --version | awk '{print $2}')" >> "$GITHUB_ENV"
+          echo "NITRO_CLI_VERSION=$(nitro-cli --version | awk '{print $NF}')" >> "$GITHUB_ENV"
+
+      - name: Build reproducible CoCo workload image
+        env:
+          COCO_IMAGE_REF: ghcr.io/${{ github.repository_owner }}/ocr-demo:${{ github.ref_name }}
+        run: |
+          COCO_DEPLOY_IMAGE_DIGEST="$IMAGE_DIGEST" scripts/build-coco-image.sh build
+          COCO_IMAGE_DIGEST="$(cat build/coco-image-digest.txt)"
+          echo "COCO_IMAGE_DIGEST=$COCO_IMAGE_DIGEST" >> "$GITHUB_ENV"
+
+      - name: Generate provenance and checksums
+        run: |
+          python3 tools/generate_provenance.py \
+            --workload-id "$WORKLOAD_ID" \
+            --repo-url "$ENCLAVE_REPO_URL" \
+            --project-repo-url "$PROJECT_REPO_URL" \
+            --release-tag "${GITHUB_REF_NAME}" \
+            --commit-sha "${GITHUB_SHA}" \
+            --oci-image-digest "$IMAGE_DIGEST" \
+            --eif-path build/ztbrowser-enclave.eif \
+            --describe-eif-path build/describe-eif.json \
+            --release-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
+            --nitro-cli-version "$NITRO_CLI_VERSION" \
+            --nitro-cli-source-repo "$NITRO_CLI_SOURCE_REPO" \
+            --nitro-cli-source-tag "$NITRO_CLI_SOURCE_TAG" \
+            --docker-version "$DOCKER_VERSION" \
+            --rust-version "$RUST_VERSION" \
+            --cargo-version "$CARGO_VERSION" \
+            --output-path build/provenance.json
+          python3 tools/generate_coco_artifacts.py \
+            --service-config ztinfra-service.yaml \
+            --release-id "${GITHUB_REF_NAME}" \
+            --coco-image-digest "$COCO_IMAGE_DIGEST" \
+            --initdata-path build/coco-initdata.json \
+            --runtime-config-path build/coco-runtime-config.json
+          python3 tools/generate_release_manifest.py \
+            --service-config ztinfra-service.yaml \
+            --provenance build/provenance.json \
+            --release-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
+            --coco-image-digest "$COCO_IMAGE_DIGEST" \
+            --coco-initdata-path build/coco-initdata.json \
+            --manifest-path build/release-manifest.json \
+            --coco-runtime-config-path build/coco-runtime-config.json
+          python3 tools/verify_coco_release.py \
+            --release-manifest build/release-manifest.json \
+            --runtime-config build/coco-runtime-config.json \
+            --initdata build/coco-initdata.json \
+            --coco-image-digest build/coco-image-digest.txt \
+            --oci-archive build/coco-workload.oci.tar
+          (cd build && sha256sum ztbrowser-enclave.eif describe-eif.json provenance.json release-manifest.json coco-runtime-config.json coco-initdata.json coco-image-digest.txt coco-image-ref.txt coco-oci-manifest-digest.txt coco-workload.oci.tar coco-workload.oci.tar.sha256 > SHA256SUMS)
+          python3 tools/render_facts_row.py --release-manifest build/release-manifest.json > build/facts-row.json
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/ztbrowser-enclave.eif
+            build/describe-eif.json
+            build/provenance.json
+            build/release-manifest.json
+            build/coco-runtime-config.json
+            build/coco-initdata.json
+            build/coco-image-digest.txt
+            build/coco-image-ref.txt
+            build/coco-oci-manifest-digest.txt
+            build/coco-workload.oci.tar
+            build/coco-workload.oci.tar.sha256
+            build/SHA256SUMS
+
+      - name: Check out facts target repo
+        uses: actions/checkout@v4
+        with:
+          repository: rusyaew/ztbrowser
+          ref: main
+          path: facts-target
+          token: ${{ secrets.ZTINFRA_FACTS_PR_TOKEN }}
+
+      - name: Update facts DB row
+        run: |
+          python3 tools/upsert_facts_db.py \
+            --facts-db facts-target/facts-node/facts-db.json \
+            --facts-row build/facts-row.json
+
+      - name: Create facts PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.ZTINFRA_FACTS_PR_TOKEN }}
+          path: facts-target
+          commit-message: "Update canonical facts for ${{ github.ref_name }}"
+          branch: "facts/ztbrowser-aws-nitro/${{ github.ref_name }}"
+          delete-branch: true
+          title: "Update canonical facts for ${{ github.ref_name }}"
+          body: |
+            Canonical enclave release facts update.
+
+            - workload_id: ocr-demo-aws-nitro
+            - release_tag: ${{ github.ref_name }}
+            - commit_sha: ${{ github.sha }}
+            - release_url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+
+            The exact release identity values come from `build/release-manifest.json` in this release workflow.

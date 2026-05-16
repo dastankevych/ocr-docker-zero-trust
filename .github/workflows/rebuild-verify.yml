@@ -1,0 +1,52 @@
+name: Rebuild Verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: Git repository URL to rebuild
+        required: true
+        type: string
+      ref:
+        description: Git ref to rebuild
+        required: true
+        type: string
+      provenance_url:
+        description: URL to expected provenance.json
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out verifier repo
+        uses: actions/checkout@v4
+
+      - name: Install rebuild dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang curl git libclang-dev libssl-dev make pkg-config python3
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+
+      - name: Run rebuild verification
+        run: |
+          tools/rebuild-verify.sh \
+            --repo-url "${{ inputs.repo_url }}" \
+            --ref "${{ inputs.ref }}" \
+            --expected-provenance-url "${{ inputs.provenance_url }}"
+
+      - name: Upload rebuild artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebuild-verify-output
+          path: build/rebuild-verify

@@ -5,6 +5,11 @@
     <link rel="stylesheet" media="all" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.3.1/css/bootstrap.min.css" />
     <link href="./css/style.css" rel="stylesheet" id="style-css">
 
+    {% if manifest_json %}
+    <script type="application/ztbrowser-trusted-inputs+json">
+{{ manifest_json | safe }}
+    </script>
+    {% endif %}
 
 </head>
 
@@ -18,7 +23,7 @@
                         <div class="input-group">
                             <span class="input-group-btn">
                                 <span class="btn btn-primary btn-file">
-                                    Browse… <input type="file" id="imgInp" name="file">
+                                    Browse… <input type="file" id="imgInp" name="file" data-ztf-group="ocr" data-ztf-field="document">
                                 </span>
                             </span>
                             <input type="text" class="form-control" readonly>
@@ -35,7 +40,7 @@
                     </div>
 
 
-                    <div class='form-group' style="display: block;width:50%;margin:0 auto;"> 
+                    <div class='form-group' style="display: block;width:50%;margin:0 auto;">
                         <table id="working">
                             <tr>
                                 <td>
@@ -59,10 +64,10 @@
 
                     <div class="form-group">
                         <label for="InputUsername">Result</label>
-                        <textarea class="form-control" name="result" id="result"></textarea>
+                        <textarea class="form-control" name="result" id="result" data-ztbrowser-result-for="ocr"></textarea>
                         <small id="transcriptHelp" class="form-text text-muted"></small>
                     </div>
-                    <button type="button" id="ocr" class="btn btn-primary">Run OCR</button>
+                    <button type="button" id="ocr" class="btn btn-primary" data-zts-group="ocr">Run OCR</button>
                 </form>
             </div>
         </div>
