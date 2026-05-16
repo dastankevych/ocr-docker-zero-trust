@@ -140,4 +140,4 @@ def send_css(path):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=8080)
+    app.run(debug=False, use_reloader=False, host="0.0.0.0", port=8080)
